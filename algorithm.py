@@ -15,10 +15,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'  # Log message format
 )
 
-# Define PowerFlowEnv environment
-import gym
-import numpy as np
-
 class PowerFlowEnv(gym.Env):
     def __init__(self, bus_data, line_data, max_steps=2000):
         super(PowerFlowEnv, self).__init__()
