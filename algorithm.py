@@ -3,41 +3,74 @@ import gym
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from scipy.io import loadmat
+import logging
+import time
+
+# Configure logging to write to a file named `training_log.log`
+logging.basicConfig(
+    filename='training.log',  # Specify the log file name
+    filemode='w',  # Use 'w' to overwrite the file each run, 'a' to append
+    level=logging.DEBUG,  # Log level
+    format='%(asctime)s - %(levelname)s - %(message)s'  # Log message format
+)
 
 # Define PowerFlowEnv environment
+import gym
+import numpy as np
+
 class PowerFlowEnv(gym.Env):
-    def __init__(self, bus_data, line_data):
+    def __init__(self, bus_data, line_data, max_steps=2000):
         super(PowerFlowEnv, self).__init__()
         self.bus_data = bus_data  # List of bus data (P_demand, Q_demand, voltage limits)
         self.line_data = line_data  # List of line data (from_bus, to_bus, resistance, reactance)
+        self.max_steps = max_steps  # Maximum number of steps before the episode ends
+        self.current_step = 0  # Step counter to track the number of steps in the current episode
         self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(len(bus_data),), dtype=np.float32)
         self.action_space = gym.spaces.Box(low=-1, high=1, shape=(len(bus_data),), dtype=np.float32)
 
     def reset(self):
-        # Initialize voltages at each bus as part of the state
-        self.state = np.random.uniform(low=0.95, high=1.05, size=len(self.bus_data))  
+        # Reset the environment's state
+        self.current_step = 0  # Reset step counter for a new episode
+        self.state = np.random.uniform(low=0.95, high=1.05, size=len(self.bus_data))  # Initial voltages
         return self.state
 
     def calculate_power_flow(self):
+        # Calculate the total power loss in the system
         power_loss = 0.0
         for from_bus, to_bus, r, x in self.line_data:
             V_from = self.state[from_bus]
             V_to = self.state[to_bus]
-            delta_theta = np.angle(V_from) - np.angle(V_to)  # Angle difference between buses
-            current = (V_from - V_to) / complex(r, x)  # Current calculation using Ohm's law
-            power_loss += abs(V_from * np.conj(current))  # Power loss calculation
+            delta_v = V_from - V_to  # Voltage difference between buses
+            impedance = complex(r, x)
+            current = delta_v / impedance  # Calculate current based on Ohm's law
+            power_loss += abs(V_from * np.conj(current))  # Accumulate power loss
         return power_loss
 
     def step(self, action):
-        self.state += action * 0.1  # Adjust voltages based on actions
+        # Apply action to update voltages
+        self.state += action * 0.1
         power_loss = self.calculate_power_flow()
-        reward = -power_loss  # Reward is the negative of power loss
-        done = False  # This problem does not have a terminal state
+        reward = -power_loss  # Reward is the negative of power loss to encourage minimizing losses
+
+        # Increment the step counter
+        self.current_step += 1
+
+        # Define termination conditions
+        done = False
+        if self.current_step >= self.max_steps:
+            done = True  # End the episode if the maximum steps are reached
+        elif power_loss > 10.0:  # Example threshold, adjust based on your system's specifics
+            done = True  # End if power loss is too high
+        elif np.any((self.state < 0.9) | (self.state > 1.1)):  # Voltage limits
+            done = True  # End if any bus voltage goes out of acceptable bounds
+
         return self.state, reward, done, {}
 
     def calculate_reward(self):
+        # Calculate reward separately if needed
         return -self.calculate_power_flow()
-    
+
 
 # Actor Network: This network generates actions based on the observed state
 class ActorNetwork(nn.Module):
@@ -117,43 +150,46 @@ class PPOAgent:
         return advantages  # Return list of advantages
 
     def update(self, states, actions, rewards, dones, values):
-        # Update actor and critic using PPO clipping
-        # States, actions, rewards, dones, values are stored from the episode
+        # Convert lists to tensors with consistent dimensions
+        states = torch.FloatTensor(np.array(states))  # Convert list of arrays to a single numpy array first
+        actions = torch.FloatTensor(np.array(actions))
+        rewards = torch.FloatTensor(rewards).unsqueeze(-1)  # Ensure rewards have shape [N, 1]
+        dones = torch.FloatTensor(dones)
+        values = torch.FloatTensor(values).unsqueeze(-1)  # Ensure values have shape [N, 1]
 
-        states = torch.FloatTensor(states)  # Convert states to tensor
-        actions = torch.FloatTensor(actions)  # Convert actions to tensor
-        rewards = torch.FloatTensor(rewards)  # Convert rewards to tensor
-        dones = torch.FloatTensor(dones)  # Convert dones to tensor (binary done signals)
-        values = torch.FloatTensor(values)  # Convert values (state-value estimates) to tensor
+        next_value = self.critic(states[-1].unsqueeze(0))  # Shape adjustment for the last state
+        advantages = self.compute_advantages(rewards, values, next_value, dones)  # Compute advantages
 
-        next_value = self.critic(states[-1])  # Estimate value of the last state
-        advantages = self.compute_advantages(rewards, values, next_value, dones)  # Calculate advantages
-
-        # Perform multiple epochs to refine actor and critic networks
-        for _ in range(10):
-            # Actor updates: determine action probabilities
+        for _ in range(10):  # Multiple epochs to refine networks
+            # Actor updates: calculate action probabilities
             current_actions = self.actor(states)
-            action_log_probs = -((current_actions - actions)**2).mean()  # Negative log-probabilities (for simplicity)
-            ratio = torch.exp(action_log_probs - action_log_probs.detach())  # Ratio of new to old policies
+            action_log_probs = -((current_actions - actions) ** 2).mean()  # Negative log-probabilities (for simplicity)
+            ratio = torch.exp(action_log_probs - action_log_probs.detach())  # New-to-old policy ratio
 
-            # Calculate actor loss with PPO Clipping (limits policy updates for stability)
-            surr1 = ratio * torch.FloatTensor(advantages)
-            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * torch.FloatTensor(advantages)
+            # PPO Clipping for actor loss
+            advantages_tensor = torch.FloatTensor(advantages).unsqueeze(-1)  # Match dimensions for advantages
+            surr1 = ratio * advantages_tensor
+            surr2 = torch.clamp(ratio, 1 - self.eps_clip, 1 + self.eps_clip) * advantages_tensor
             actor_loss = -torch.min(surr1, surr2).mean()  # Minimize clipped objective
 
-            # Critic loss: minimizes MSE between predicted and actual rewards
-            critic_loss = nn.MSELoss()(self.critic(states).squeeze(), rewards)
+            # Critic loss using MSE between predicted and actual rewards
+            critic_loss = nn.MSELoss()(self.critic(states).squeeze(), rewards.squeeze())
 
-            # Backpropagation for combined actor-critic loss
-            loss = actor_loss + 0.5 * critic_loss  # Weighted sum of losses
-            self.optimizer.zero_grad()  # Zero gradients for optimizer
-            loss.backward()  # Backpropagation
-            self.optimizer.step()  # Optimizer update step
+            # Combined actor-critic loss and optimizer step
+            loss = actor_loss + 0.5 * critic_loss
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
 
 
 # Main Training Loop: runs through episodes and updates agent after each episode
 def train(agent, env, episodes=500):
     for episode in range(episodes):
+
+        logging.info("_" * 120)  # Adds a line with 120 underscores
+        logging.info(f"Starting Episode {episode + 1}")
+        start_time = time.time()
+
         state = env.reset()  # Reset environment to start of episode
         done = False
         episode_reward = 0  # Track cumulative reward for the episode
@@ -161,9 +197,17 @@ def train(agent, env, episodes=500):
 
         # Run the episode
         while not done:
+            logging.debug("Selecting action...")
             action = agent.select_action(state)  # Agent selects an action based on state
+            logging.debug(f"Action selected: {action}")
+
+            logging.debug("Taking step in environment...")
             next_state, reward, done, _ = env.step(action)  # Environment returns next state and reward
+            logging.debug(f"Step taken, reward: {reward}, done: {done}")
+
+            logging.debug("Getting value from critic...")
             value = agent.critic(torch.FloatTensor(state))  # Get state value from critic
+            logging.debug(f"Value obtained: {value.item()}")
 
             # Store episode data for policy update
             states.append(state)
@@ -173,18 +217,34 @@ def train(agent, env, episodes=500):
             values.append(value.item())
 
             # Update state and cumulative reward
+
             state = next_state
             episode_reward += reward
 
         # After episode ends, update the PPO agent
+        logging.info(f"Episode {episode + 1} finished, starting agent update...")
         agent.update(states, actions, rewards, dones, values)
+        logging.info(f"Episode {episode + 1}, Reward: {episode_reward}, Time: {time.time() - start_time:.2f} seconds")
+
         print(f"Episode {episode + 1}, Reward: {episode_reward}")  # Track reward to monitor learning progress
 
-# # Instantiate environment and agent
-# env = PowerFlowEnv(bus_data=[(i, 1.0, 0.5) for i in range(10)], line_data=[(i, i+1, 0.1, 0.1) for i in range(9)])
-# state_dim = env.observation_space.shape[0]  # State dimension
-# action_dim = env.action_space.shape[0]  # Action dimension
-# agent = PPOAgent(state_dim, action_dim)  # Initialize PPO agent
 
-# # Train the agent with the environment
-# train(agent, env, episodes=500)  # Start the training process
+# Load the MATLAB data file
+data = loadmat('powerflow_data.mat')
+bus_data = data['bus_data']  # Extract bus data from MATLAB file
+branch_data = data['branch_data']  # Extract branch data (line data)
+
+# Format data to match PowerFlowEnv requirements
+bus_data_list = [(int(row[0]), row[1], row[2]) for row in bus_data]  # Adjusted for bus data format (BusNum, LoadMW, LoadMVAR)
+line_data_list = [(int(row[0])-1, int(row[1])-1, row[2], row[3]) for row in branch_data]  # Adjusted for line data format (from_bus, to_bus, resistance, reactance)
+
+# Instantiate the environment using the MATLAB-loaded data
+env = PowerFlowEnv(bus_data=bus_data_list, line_data=line_data_list)
+state_dim = env.observation_space.shape[0]  # State dimension based on the environment's observation space
+action_dim = env.action_space.shape[0]  # Action dimension based on the environment's action space
+
+# Initialize the PPO Agent
+agent = PPOAgent(state_dim, action_dim)
+
+# Train the agent using the environment with the MATLAB data
+train(agent, env, episodes=50)

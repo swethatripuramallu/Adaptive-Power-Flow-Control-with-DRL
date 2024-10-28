@@ -123,3 +123,7 @@ zone_data = [
 owner_data = [
     1
 ];
+
+% Save bus_data and line_data (branch_data) to a .mat file
+save('powerflow_data.mat', 'bus_data', 'branch_data');
+
