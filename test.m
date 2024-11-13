@@ -48,7 +48,7 @@ fixed_shunt_data = [
 % 1. BusNum: Bus number
 % 2. ID: Generator identifier
 % 3. PG: Active power output (MW)
-% 4. QG: Reactive power output (MVAR)
+% 4. QG: Reactive power output (MVAR) 
 % 5. Qmax: Maximum reactive power output (MVAR)
 % 6. Qmin: Minimum reactive power output (MVAR)
 % 7. VoltageSetpoint: Voltage setpoint (p.u.)
