@@ -1,13 +1,12 @@
 import numpy as np
-import gym
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from scipy.io import loadmat
 import logging
-import time
+from pypower.api import loadcase, runpf
 
-# Configure logging to write to a file named `training_log.log`
+# Configure logging to write to a file named training_log.log
 logging.basicConfig(
     filename='training.log',
     filemode='w',
@@ -19,46 +18,128 @@ logging.basicConfig(
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-class PowerFlowEnv(gym.Env):
-    def __init__(self, bus_data, line_data, max_steps=24):
-        super(PowerFlowEnv, self).__init__()
-        self.bus_data = bus_data
-        self.line_data = line_data
-        self.max_steps = max_steps
+
+class PyPowerEnv:
+    def __init__(self, case_file, max_steps=1): #need to change max steps to 24
+        """
+        Initialize the PyPower environment.
+        
+        Parameters:
+        - case_file: The MATPOWER case file (as a dictionary or filepath) to load.
+        - max_steps: Maximum steps for an episode (24 steps for a 24-hour day).
+        """
+        self.case_file = case_file
+        self.max_steps = max_steps  # Set to 24 steps to represent each hour in a day
         self.current_step = 0
-        self.observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(len(bus_data),), dtype=np.float32)
-        self.action_space = gym.spaces.Box(low=-1, high=1, shape=(len(bus_data),), dtype=np.float32)
+        self.mpc = self.load_case_file()
+        self.state = self.get_initial_state()
+        self.done = False
+
+        # System parameters and battery SOC limits
+        self.Q_pv_min, self.Q_pv_max = 0, 6.87  # MW for PV
+        self.Q_w_min, self.Q_w_max = 0, 0.968  # MW for wind
+        self.P_bss_min, self.P_bss_max = -2, 2  # MW for battery
+        self.Q_bss_min, self.Q_bss_max = 0, 0.968  # MW for battery
+        self.V_min, self.V_max = 0.94, 1.06  # Voltage limits in p.u.
+        self.E_max, self.E_min = 3.6, 0.8  # MWh, energy capacity limits
+        self.battery_energy = 2.0  # Initial battery SOC in MWh
+        self.mu_b = 0.98  # Charging/discharging efficiency
+
+    def load_case_file(self):
+        """Load the MATPOWER case file."""
+        if isinstance(self.case_file, dict):
+            return self.case_file  # Use the provided dictionary
+        return loadcase(self.case_file)  # Load the case file from filepath
+
+    def get_initial_state(self):
+        """Initialize the state with bus voltages."""
+        self.mpc = self.load_case_file()  # Reload the case file
+        results, success = runpf(self.mpc)
+        if not success:
+            raise RuntimeError("Initial power flow did not converge")
+        return results['bus'][:, 7]  # Return initial bus voltages (magnitudes)
 
     def reset(self):
+        """Reset the environment."""
         self.current_step = 0
-        self.state = np.random.uniform(low=0.95, high=1.05, size=len(self.bus_data))
+        self.done = False
+        self.battery_energy = 2.0  # Reset battery SOC at the start of each day
+        self.state = self.get_initial_state()
         return self.state
 
-    def calculate_power_flow(self):
-        power_loss = 0.0
-        for from_bus, to_bus, r, x in self.line_data:
-            V_from = self.state[from_bus]
-            V_to = self.state[to_bus]
-            delta_v = V_from - V_to
-            impedance = complex(r, x)
-            current = delta_v / impedance
-            power_loss += abs(V_from * np.conj(current))
-        return power_loss
+    def update_soc(self, P_b):
+        """
+        Update the state of charge (SOC) of the battery based on active power (P_b).
+        """
+        # Equation (9): E(t+1) = E(t) + mu_b * P_b * time_step
+        self.battery_energy += self.mu_b * P_b * 1.0  # 1-hour step
+
+    def calculate_penalty(self):
+        """
+        Calculate the penalty p(t) based on SOC limits.
+        """
+        soc_percentage = (self.battery_energy / self.E_max) * 100  # SOC as a percentage of E_max
+        penalty = 0
+        
+        # Equation (15): Apply penalties based on SOC levels
+        if soc_percentage < 20:
+            penalty -= 0.1 * (20 - soc_percentage)  # Penalty for SOC < 20%
+        elif soc_percentage > 90:
+            penalty -= 0.1 * (soc_percentage - 90)  # Penalty for SOC > 90%
+        
+        return penalty
 
     def step(self, action):
-        self.state += action * 0.1
-        power_loss = self.calculate_power_flow()
-        reward = -power_loss
+        penalty = 0
 
+        # Extract battery and generator actions
+        Q_pv = action[0:2]
+        Q_w = action[2]
+        P_bss = action[3]
+        Q_bss = action[4]
+
+        # Update actions in mpc
+        self.mpc['gen'][1, 2] = Q_pv[0]
+        self.mpc['gen'][2, 2] = Q_pv[1]
+        self.mpc['gen'][4, 2] = Q_w
+        self.mpc['gen'][3, 1] = P_bss
+        self.mpc['gen'][3, 2] = Q_bss
+
+        # Update SOC based on the battery active power
+        self.update_soc(P_bss)
+
+        # Calculate SOC penalty based on the updated battery energy
+        soc_penalty = self.calculate_penalty()
+        penalty += soc_penalty
+
+        # Run power flow and calculate system losses
+        try:
+            bus_voltages, system_loss = self.calculate_power_flow()
+        except RuntimeError:
+            self.done = True
+            return self.state, -100.0, self.done, {"battery_energy": self.battery_energy, "soc_penalty": penalty}
+
+        # Voltage constraints
+        for voltage in bus_voltages:
+            if voltage < self.V_min or voltage > self.V_max:
+                penalty -= 20  # Additional penalty for voltage violations
+
+        # Calculate reward based on power loss and penalties
+        reward = -system_loss + penalty
+
+        # Update state and check if the episode should end
         self.current_step += 1
-        done = False
-        if self.current_step >= self.max_steps or power_loss > 10.0 or np.any((self.state < 0.9) | (self.state > 1.1)):
-            done = True
+        if self.current_step >= self.max_steps:
+            self.done = True
 
-        return self.state, reward, done, {}
+        # Update state
+        self.state = bus_voltages
+        return self.state, reward, self.done, {
+            "battery_energy": self.battery_energy, 
+            "soc_penalty": soc_penalty,
+            "system_loss": system_loss
+        }
 
-    def calculate_reward(self):
-        return -self.calculate_power_flow()
 
 # Actor Network
 class ActorNetwork(nn.Module):
@@ -70,11 +151,12 @@ class ActorNetwork(nn.Module):
             nn.Linear(128, 64),
             nn.ReLU(),
             nn.Linear(64, output_dim),
-            nn.Tanh()
+            nn.Tanh()  # Output in range [-1, 1]
         )
 
     def forward(self, state):
         return self.fc(state)
+
 
 # Critic Network
 class CriticNetwork(nn.Module):
@@ -91,12 +173,15 @@ class CriticNetwork(nn.Module):
     def forward(self, state):
         return self.fc(state)
 
+
 # PPO Agent
 class PPOAgent:
-    def __init__(self, state_dim, action_dim, lr=0.0003, gamma=0.99, eps_clip=0.2):
+    def __init__(self, state_dim, action_dim, lr=0.0003,
+                 gamma=0.99, eps_clip=0.1):
         self.actor = ActorNetwork(state_dim, action_dim).to(device)
         self.critic = CriticNetwork(state_dim).to(device)
-        self.optimizer = optim.Adam(list(self.actor.parameters()) + list(self.critic.parameters()), lr=lr)
+        self.optimizer = optim.Adam(list(self.actor.parameters()) 
+                                    + list(self.critic.parameters()), lr=lr)
         self.gamma = gamma
         self.eps_clip = eps_clip
 
@@ -123,7 +208,8 @@ class PPOAgent:
         values = torch.FloatTensor(values).unsqueeze(-1).to(device)
 
         next_value = self.critic(states[-1].unsqueeze(0))
-        advantages = self.compute_advantages(rewards.cpu(), values.cpu(), next_value.cpu(), dones.cpu())
+        advantages = self.compute_advantages(rewards.cpu(), values.cpu(), 
+                                             next_value.cpu(), dones.cpu())
 
         for _ in range(10):
             current_actions = self.actor(states)
@@ -140,68 +226,57 @@ class PPOAgent:
             loss.backward()
             self.optimizer.step()
 
+
 # Training Loop
-def train(agent, env, episodes=50):
-   # Open the log file in append mode
-    with open("power_flow_data.log", "a") as log_file:
-        if log_file.tell() == 0:  # Check if the file is empty to write a header
-            log_file.write("Episode, Step, Bus_Powers, Reward\n")  # Write the header only if the file is empty
+def train(agent, env, episodes=360): # need to change to episodes to 360
+    # Open log files for storing results
+    with open("training_episode_data.log", "a") as power_flow_log, open("training_step_data.log", "a") as action_state_log:
+        # Write headers if files are empty
+        if power_flow_log.tell() == 0:
+            power_flow_log.write("Episode,Hour,Power_Loss,Reward\n")
+        if action_state_log.tell() == 0:
+            action_state_log.write("Episode,Hour,Action,State_of_Charge\n")
 
+        # Loop through each episode (one day)
         for episode in range(episodes):
-            logging.info("_" * 120)
-            logging.info(f"Starting Episode {episode + 1}")
-            start_time = time.time()
-
-            state = env.reset()
+            state = env.reset()  # Reset environment at the beginning of each day
             done = False
             episode_reward = 0
-            states, actions, rewards, dones, values = [], [], [], [], []
-            step = 0
 
-            while not done:
-                logging.debug("Selecting action...")
-                action = agent.select_action(state)
-                logging.debug(f"Action selected: {action}")
+            # 24 steps, each representing one hour of the day
+            for hour in range(24):
+                # Define action bounds
+                action_bounds = np.array([
+                    [0, 6.87],  # PV1 reactive power
+                    [0, 6.87],  # PV2 reactive power
+                    [0, 0.968],  # Wind reactive power
+                    [-2, 2],     # Battery active power
+                    [0, 0.968],  # Battery reactive power
+                ])
 
-                logging.debug("Taking step in environment...")
-                next_state, reward, done, _ = env.step(action)
-                logging.debug(f"Step taken, reward: {reward}, done: {done}")
+                # Select action within bounds for each generator and battery
+                action = agent.select_action(state, action_bounds)
 
-                logging.debug("Getting value from critic...")
-                value = agent.critic(torch.FloatTensor(state).to(device))
-                logging.debug(f"Value obtained: {value.item()}")
+                # Take a step in the environment
+                next_state, reward, done, info = env.step(action)
 
-                bus_powers = state.tolist()
-                log_file.write(f"{episode + 1}, {step + 1}, {bus_powers}, {reward}\n")
+                # Retrieve SOC and power loss
+                soc = info["battery_energy"]
+                soc_penalty = info["soc_penalty"]
+                system_loss = info["system_loss"]
+                
+                # Log data for each hour in power_flow_data.log
+                power_flow_log.write(f"{episode + 1},{hour + 1},{system_loss},{reward}\n")
 
-                states.append(state)
-                actions.append(action)
-                rewards.append(reward)
-                dones.append(done)
-                values.append(value.item())
+                # Log action and SOC for each hour in action_state_data.log
+                action_state_log.write(f"{episode + 1},{hour + 1},{action},{soc}\n")
 
-                state = next_state
+                # Update the agent based on the reward and new state
+                agent.update(state, action, reward, next_state, done)
+                
+                # Accumulate total reward for the episode
                 episode_reward += reward
-                step += 1
+                state = next_state
 
-            logging.info(f"Episode {episode + 1} finished, starting agent update...")
-            agent.update(states, actions, rewards, dones, values)
-            logging.info(f"Episode {episode + 1}, Reward: {episode_reward}, Time: {time.time() - start_time:.2f} seconds")
-            print(f"Episode {episode + 1}, Reward: {episode_reward}")
-
-# Load the MATLAB data file
-data = loadmat('powerflow_data.mat')
-bus_data = data['bus_data']
-branch_data = data['branch_data']
-bus_data_list = [(int(row[0]), row[1], row[2]) for row in bus_data]
-line_data_list = [(int(row[0])-1, int(row[1])-1, row[2], row[3]) for row in branch_data]
-
-env = PowerFlowEnv(bus_data=bus_data_list, line_data=line_data_list)
-state_dim = env.observation_space.shape[0]
-action_dim = env.action_space.shape[0]
-
-# Initialize the PPO Agent
-agent = PPOAgent(state_dim, action_dim)
-
-# Train the agent using the environment with the MATLAB data
-train(agent, env, episodes=50)
+            # Print the cumulative reward for the episode (one day)
+            print(f"Episode {episode + 1}: Total Reward = {episode_reward}")
