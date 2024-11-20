@@ -111,6 +111,6 @@ mpc.gencost = [
 % ***** MVA limit of branch 12 - 13 not given, set to 9900
 % ***** MVA limit of branch 13 - 14 not given, set to 9900
 
-% % Save all data in a single structure
-% data.mpc = mpc;
-% save('case14mod.mat', '-struct', 'data');
+% Save all data in a single structure
+data.mpc = mpc;
+save('case14mod.mat', '-struct', 'data');

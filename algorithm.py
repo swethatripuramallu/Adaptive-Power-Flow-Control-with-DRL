@@ -1,10 +1,10 @@
-# Import necessary libraries
 import numpy as np
-import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from pypower.api import loadcase, runpf
+from scipy.io import loadmat
+from pypower.api import runpf
+import csv
 
 # Check if GPU is available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -24,8 +24,9 @@ class PyPowerEnv:
         self.case_file = case_file
         self.max_steps = max_steps
         self.current_step = 0
-        self.mpc = self.load_case_file()
-        self.state = self.get_initial_state()
+        self.episodes = 0
+        self.training_data = self.load_training_data()
+        self.state = None
         self.done = False
 
         # System parameters and battery SOC limits
@@ -38,19 +39,47 @@ class PyPowerEnv:
         self.battery_energy = 2.0  # Initial battery SOC in MWh
         self.mu_b = 0.98  # Charging/discharging efficiency
 
-    def load_case_file(self):
-        """Load the MATPOWER case file."""
-        if isinstance(self.case_file, dict):
-            return self.case_file
-        return loadcase(self.case_file)
+    def load_training_data(self):
+        """Load the training data from a .mat file."""
+        if not self.case_file.endswith(".mat"):
+            raise ValueError("The case file must be a .mat file.")
+        
+        # Load the .mat file
+        mat_data = loadmat(self.case_file)
+        
+        if 'training_data' not in mat_data:
+            raise KeyError("The .mat file must contain a 'training_data' key.")
+        
+        # Extract and validate the data matrix
+        data_matrix = mat_data['training_data']
+        if data_matrix.shape[1] != 22:
+            raise ValueError("The data matrix must have 22 columns.")
+        
+        return data_matrix
 
-    def get_initial_state(self):
-        """Initialize the state with bus voltages."""
-        self.mpc = self.load_case_file()
-        results, success = runpf(self.mpc)
-        if not success:
-            raise RuntimeError("Initial power flow did not converge")
-        return results['bus'][:, 7]  # Return initial bus voltages (magnitudes)
+    def get_mpc(self):
+        """Convert the current training data step to a MATPOWER-compatible structure."""
+        current_data = self.training_data[self.episodes % self.training_data.shape[0], :]
+        mpc = {
+            "baseMVA": 100,
+            "bus": [
+                [1, 3, current_data[4], current_data[5], 0, 0, 1, 1.06, 0, 0, 1, 1.06, 0.94],
+                [2, 1, current_data[6], current_data[7], 0, 0, 1, 1.045, 0, 0, 1, 1.06, 0.94],
+                [3, 1, current_data[8], current_data[9], 0, 0, 1, 1.01, 0, 0, 1, 1.06, 0.94],
+                [4, 1, current_data[10], current_data[11], 0, 0, 1, 1.02, 0, 0, 1, 1.06, 0.94],
+                [5, 1, current_data[12], current_data[13], 0, 0, 1, 1.056, 0, 0, 1, 1.06, 0.94],
+            ],
+            "gen": [
+                [1, current_data[20], 0, 10, 0, 1.06, 100, 1, 332.4, 0],
+                [2, current_data[21], 0, 6.87, 0, 1.045, 100, 1, 15, 0],
+            ],
+            "branch": [
+                [1, 2, 0.01938, 0.05917, 0.0528, 9900, 0, 0, 0, 0, 1, -360, 360],
+                [2, 3, 0.04699, 0.19797, 0.0438, 9900, 0, 0, 0, 0, 1, -360, 360],
+            ],
+            "version": "2",
+        }
+        return mpc
 
     def reset(self):
         """Reset the environment."""
@@ -59,6 +88,37 @@ class PyPowerEnv:
         self.battery_energy = 2.0
         self.state = self.get_initial_state()
         return self.state
+
+    def get_initial_state(self):
+        """Initialize the state."""
+        try:
+            print("Loading MATPOWER case file...")
+            self.mpc = self.load_case_file()  # Load MATPOWER case data
+            print("Running power flow...")
+            results, success = runpf(self.mpc)  # Run power flow
+            if not success:
+                raise RuntimeError("Initial power flow did not converge")
+            print("Power flow succeeded. Initial state loaded.")
+            return results['bus'][:, 7]  # Return initial bus voltages (Vm column)
+        except Exception as e:
+            print(f"Error in get_initial_state: {e}")
+            return None
+    
+    def step(self, action):
+        """Perform one step in the environment."""
+        self.current_step += 1
+        if self.current_step >= self.max_steps:
+            self.done = True
+            return self.state, -100.0, self.done, {"battery_energy": self.battery_energy}
+
+        # Get next state (update using the next hour in training data)
+        self.update_soc(action[3])
+        self.state = self.get_initial_state()
+
+        # Example reward calculation (replace with actual logic)
+        reward = -np.random.rand()
+
+        return self.state, reward, self.done, {"battery_energy": self.battery_energy}
 
     def update_soc(self, P_b):
         """Update the state of charge (SOC) of the battery."""
@@ -180,56 +240,75 @@ class PPOAgent:
 def setup_environment_and_agent(case_file):
     """Set up the environment and PPO agent."""
     env = PyPowerEnv(case_file)
+    print(f"Environment initialized: {env}")
+    print(f"Environment state: {env.state}")
+    
+    if env.state is None:
+        raise ValueError("The environment's state is None. Check the PyPowerEnv setup.")
+
     state_dim = len(env.state)
     action_dim = 5
     agent = PPOAgent(state_dim, action_dim)
+    print(f"Agent initialized with state_dim={state_dim}, action_dim={action_dim}")
     return env, agent
 
-def train_agent(agent, env, episodes=360):
+def train_agent(agent, env, episodes=1090):
     """Train the PPO agent on the environment."""
-    step_log = []
-    episode_log = []
+    # Initialize logs as Python lists
+    step_log = [["Episode", "Hour", "Action", "Battery_Energy", "System_Loss"]]
+    episode_log = [["Episode", "Total_Reward", "Total_Loss"]]
+
     for episode in range(episodes):
-        state = env.reset()
+        state = env.reset()  # Reset the environment at the start of each episode
         episode_reward = 0
         episode_loss = 0
 
-        for hour in range(24):  # Each episode has 24 steps
-            action = agent.select_action(state)
-            next_state, reward, done, info = env.step(action)
+        for hour in range(env.max_steps):  # Iterate over the max steps (e.g., 24 for a day)
+            action = agent.select_action(state)  # Get action from the agent
+            next_state, reward, done, info = env.step(action)  # Take a step in the environment
 
-            step_log.append(
-                {
-                    "Episode": episode + 1,
-                    "Hour": hour + 1,
-                    "Action": action.tolist(),
-                    "Battery_Energy": info["battery_energy"],
-                }
-            )
+            # Append step details to the log
+            step_log.append([
+                episode + 1,  # Episode number
+                hour + 1,  # Hour within the episode
+                action.tolist(),  # Action taken
+                info.get("battery_energy", 0),  # Battery energy state
+                info.get("system_loss", 0),  # System losses
+            ])
+
+            # Update episode metrics
             episode_reward += reward
-            episode_loss += info["system_loss"]
+            episode_loss += info.get("system_loss", 0)
             state = next_state
-            if done:
+
+            if done:  # Stop the episode if the environment signals completion
                 break
 
-        episode_log.append(
-            {
-                "Episode": episode + 1,
-                "Total_Reward": episode_reward,
-                "Total_Loss": episode_loss,
-            }
-        )
-        print(f"Episode {episode + 1}: Total Reward = {episode_reward}")
+        # Append episode summary to the log
+        episode_log.append([
+            episode + 1,  # Episode number
+            episode_reward,  # Total reward for the episode
+            episode_loss,  # Total loss for the episode
+        ])
+        print(f"Episode {episode + 1}: Total Reward = {episode_reward:.2f}, Total Loss = {episode_loss:.2f}")
 
-    pd.DataFrame(step_log).to_csv("step_log_case14.csv", index=False)
-    pd.DataFrame(episode_log).to_csv("episode_log_case14.csv", index=False)
+    # Write logs to CSV files using the csv module
+    with open("step_log_case1.csv", "w", newline="") as step_file:
+        writer = csv.writer(step_file)
+        writer.writerows(step_log)
+
+    with open("episode_log_case1.csv", "w", newline="") as episode_file:
+        writer = csv.writer(episode_file)
+        writer.writerows(episode_log)
+
+    print("Training complete. Logs saved to 'step_log_case1.csv' and 'episode_log_case1.csv'.")
 
 # Function to start training
-def run_training(case_file, episodes=360):
+def run_training(case_file, episodes=1090):
     """Run the entire training process."""
     env, agent = setup_environment_and_agent(case_file)
     train_agent(agent, env, episodes)
 
 # Example usage
-case_file = "case14.m"  # Replace with the actual path to case14.m
-run_training(case_file, episodes=360)
+case_file = "training_data.mat"  # Replace with the actual path to case14.m
+run_training(case_file, episodes=1090)
