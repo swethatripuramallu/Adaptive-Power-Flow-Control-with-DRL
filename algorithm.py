@@ -4,7 +4,9 @@ import torch.nn as nn
 import torch.optim as optim
 from scipy.io import loadmat
 from pypower.api import runpf, loadcase
+import matlab.engine
 import csv
+import h5py
 
 
 # Utility: Check if GPU is available
@@ -32,20 +34,57 @@ class PyPowerEnv:
         self.P_bss_min, self.P_bss_max = -2, 2  # MW
         self.E_max, self.E_min = 3.6, 0.8  # MWh
 
+    # def load_training_data(self):
+    #     """Load and validate training data from a .mat file."""
+    #     print(f"Loading training data from: {self.case_file}")
+    #     mat_data = loadmat(self.case_file)
+
+    #     if "training_data" not in mat_data:
+    #         raise KeyError("The .mat file must contain a 'training_data' key.")
+
+    #     data = mat_data["training_data"]
+    #     if data.shape[1] != 22:
+    #         raise ValueError("Training data must have exactly 22 columns.")
+
+    #     print(f"Training data loaded. Shape: {data.shape}")
+    #     return data
+    # def load_training_data(self):
+    #     """Load and validate training data from a .mat file."""
+    #     try:
+    #         print(f"Loading training data from: {self.training_data_file}")
+
+    #         # Check the file format
+    #         if self.training_data_file.endswith(".mat"):
+    #             with h5py.File(self.training_data_file, "r") as mat_data:
+    #                 # Extract the training data
+    #                 if "training_data" not in mat_data:
+    #                     raise KeyError("The .mat file must contain a 'training_data' key.")
+
+    #                 # Load and transpose training data if needed
+    #                 training_data = mat_data["training_data"][:]
+    #                 if len(training_data.shape) != 3 or training_data.shape[2] != 22:
+    #                     raise ValueError("Training data must have shape [days, hours, 22 columns].")
+
+    #                 print(f"Training data loaded successfully. Shape: {training_data.shape}")
+    #                 return training_data
+
+    #         raise ValueError("File is not in the expected .mat format.")
+    #     except Exception as e:
+    #         print(f"Error loading training data: {e}")
+    #         raise
     def load_training_data(self):
-        """Load and validate training data from a .mat file."""
-        print(f"Loading training data from: {self.case_file}")
-        mat_data = loadmat(self.case_file)
-
-        if "training_data" not in mat_data:
-            raise KeyError("The .mat file must contain a 'training_data' key.")
-
-        data = mat_data["training_data"]
-        if data.shape[1] != 22:
-            raise ValueError("Training data must have exactly 22 columns.")
-
-        print(f"Training data loaded. Shape: {data.shape}")
-        return data
+        """Load training data using MATLAB Engine."""
+        try:
+            print(f"Loading training data from: {self.training_data_file}")
+            eng = matlab.engine.start_matlab()
+            training_data = eng.load(self.training_data_file)["training_data"]
+            training_data = np.array(training_data)  # Convert to NumPy array
+            print(f"Training data loaded successfully. Shape: {training_data.shape}")
+            eng.quit()
+            return training_data
+        except Exception as e:
+            print(f"Error loading training data: {e}")
+            raise
 
     def get_mpc(self):
         """
@@ -366,7 +405,7 @@ def main(case_file, training_data_file, episodes=1090):
 
 # Example usage
 if __name__ == "__main__":
-    case_file = "case14.m"  # Replace with the actual path to case14.m
+    case_file = "case14mod.mat"  # Replace with the actual path to case14.m
     training_data_file = "training_data.mat"  # Replace with the actual path to training_data.mat
 
     main(case_file, training_data_file)
