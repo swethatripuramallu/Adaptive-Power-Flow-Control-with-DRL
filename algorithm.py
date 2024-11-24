@@ -347,13 +347,13 @@ def train_agent(agent, env, episodes=1090):
                 info.get("system_loss", 0),  # System losses
             ])
 
-            # Update episode metrics
-            episode_reward += reward
-            episode_loss += info.get("system_loss", 0)
-            state = next_state
+        # Update episode metrics
+        episode_reward += reward
+        episode_loss += info.get("system_loss", 0)
+        state = next_state
 
-            if done:  # Stop the episode if the environment signals completion
-                break
+        if done:  # Stop the episode if the environment signals completion
+            break
 
         # Append episode summary to the log
         episode_log.append([
