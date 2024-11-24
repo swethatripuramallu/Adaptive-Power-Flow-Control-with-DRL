@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from scipy.io import loadmat
-from pypower.api import runpf, loadcase
+from pypower.api import runpf, loadcase, get_losses, real
 import matlab.engine
 import csv
 import h5py
@@ -34,44 +34,6 @@ class PyPowerEnv:
         self.P_bss_min, self.P_bss_max = -2, 2  # MW
         self.E_max, self.E_min = 3.6, 0.8  # MWh
 
-    # def load_training_data(self):
-    #     """Load and validate training data from a .mat file."""
-    #     print(f"Loading training data from: {self.case_file}")
-    #     mat_data = loadmat(self.case_file)
-
-    #     if "training_data" not in mat_data:
-    #         raise KeyError("The .mat file must contain a 'training_data' key.")
-
-    #     data = mat_data["training_data"]
-    #     if data.shape[1] != 22:
-    #         raise ValueError("Training data must have exactly 22 columns.")
-
-    #     print(f"Training data loaded. Shape: {data.shape}")
-    #     return data
-    # def load_training_data(self):
-    #     """Load and validate training data from a .mat file."""
-    #     try:
-    #         print(f"Loading training data from: {self.training_data_file}")
-
-    #         # Check the file format
-    #         if self.training_data_file.endswith(".mat"):
-    #             with h5py.File(self.training_data_file, "r") as mat_data:
-    #                 # Extract the training data
-    #                 if "training_data" not in mat_data:
-    #                     raise KeyError("The .mat file must contain a 'training_data' key.")
-
-    #                 # Load and transpose training data if needed
-    #                 training_data = mat_data["training_data"][:]
-    #                 if len(training_data.shape) != 3 or training_data.shape[2] != 22:
-    #                     raise ValueError("Training data must have shape [days, hours, 22 columns].")
-
-    #                 print(f"Training data loaded successfully. Shape: {training_data.shape}")
-    #                 return training_data
-
-    #         raise ValueError("File is not in the expected .mat format.")
-    #     except Exception as e:
-    #         print(f"Error loading training data: {e}")
-    #         raise
     def load_training_data(self):
         """Load training data using MATLAB Engine."""
         try:
@@ -124,17 +86,33 @@ class PyPowerEnv:
         return self.state
 
     def get_initial_state(self):
-        """Run power flow and return initial state."""
+        """Run power flow and return the initial state based on load demands, generation, and battery SOC."""
         try:
             mpc = self.get_mpc()
             results, success = runpf(mpc)
             if not success:
                 print("Power flow failed. Returning default state.")
-                return np.zeros(len(mpc["bus"]))
-            return results["bus"][:, 7]  # Voltage magnitudes
+                return np.zeros(2 * len(mpc["bus"]) + len(mpc["gen"]) + 1)  # Default state dimension
+            
+            # Extract load demands (Pload and Qload)
+            P_load = results["bus"][:, 2]  # Active power demand
+            Q_load = results["bus"][:, 3]  # Reactive power demand
+
+            # Extract renewable generation (Pw and Ppv)
+            P_gen = results["gen"][:, 1]  # Active power generation
+            P_w = P_gen[4]  # Wind generator (assuming it's at index 4)
+            P_pv = P_gen[1:3]  # Solar generators (assuming indices 1 and 2)
+
+            # Include battery SOC
+            battery_soc = self.battery_energy
+
+            # Combine all into the state vector
+            state = np.concatenate([P_load, Q_load, P_pv, [P_w], [battery_soc]])
+            return state
         except Exception as e:
             print(f"Error during power flow: {e}")
-            return np.zeros(len(mpc["bus"]))
+            return np.zeros(2 * len(mpc["bus"]) + len(mpc["gen"]) + 1)
+
 
     def step(self, action):
         """
@@ -156,9 +134,9 @@ class PyPowerEnv:
 
         self.current_step += 1
 
-        # Update the battery energy state
+        # Update the battery energy state and calculate SOC penalty
         Pbss = action[0]  # Active power from the battery
-        self.update_battery(Pbss)
+        soc_penalty = self.update_battery(Pbss)
 
         # Fetch the current mpc
         mpc = self.get_mpc()
@@ -173,34 +151,73 @@ class PyPowerEnv:
 
         # Run the power flow analysis
         try:
-            results, success = runpf(mpc)
+            results = runpf(mpc)
 
-            # Reward calculation (example: minimize losses)
-            system_loss = np.sum(results["branch"][:, 13])  # Real power losses
-            reward = -system_loss  # Negative reward for losses
+            # Power loss
+            losses = get_losses(results)
+            system_loss = sum(real(losses))  # Real power losses
+            Ploss_penalty = system_loss  # Direct penalty for power losses
 
-            # Extract next state (e.g., bus voltage magnitudes)
-            next_state = results["bus"][:, 7]
+            # Voltage penalties
+            voltage = results["bus"][:, 7]  # Voltage magnitudes
+            voltage_penalty = np.sum((voltage < self.V_min) | (voltage > self.V_max))
+
+            # SOC deviation penalty (e.g., penalize deviation from mid-range SOC)
+            optimal_soc = (self.E_max + self.E_min) / 2
+            soc_deviation_penalty = abs(self.battery_energy - optimal_soc) ** 2
+
+            # Calculate total reward
+            reward = -Ploss_penalty - soc_penalty - voltage_penalty - soc_deviation_penalty
+
+            # Create the next state
+            P_load = results["bus"][:, 2]
+            Q_load = results["bus"][:, 3]
+            P_gen = results["gen"][:, 1]
+            P_w = P_gen[4]
+            P_pv = P_gen[1:3]
+            battery_soc = self.battery_energy
+            next_state = np.concatenate([P_load, Q_load, P_pv, [P_w], [battery_soc]])
 
             # Check if episode is complete
             self.done = self.current_step >= self.max_steps
 
-            # Return state, reward, done flag, and additional info
             return next_state, reward, self.done, {
                 "battery_energy": self.battery_energy,
                 "system_loss": system_loss,
+                "soc_penalty": soc_penalty,
+                "voltage_penalty": voltage_penalty,
             }
         except Exception as e:
             print(f"Error during power flow: {e}")
             reward = -1.0  # Penalty for exception
             self.done = True
-            return np.zeros(len(mpc["bus"])), reward, self.done, {"battery_energy": self.battery_energy}
+            return np.zeros_like(self.state), reward, self.done, {"battery_energy": self.battery_energy}
 
 
     def update_battery(self, P_b):
         """Update the battery SOC based on the action."""
         self.battery_energy += self.mu_b * P_b
-        self.battery_energy = np.clip(self.battery_energy, self.E_min, self.E_max)
+        
+        # Check for SOC violations and apply penalties
+        penalty_soc = 0
+        if self.battery_energy > self.E_max:
+            penalty_soc += (self.battery_energy - self.E_max) ** 2  # Quadratic penalty for overcharging
+            self.battery_energy = self.E_max  # Prevent exceeding max limit
+        elif self.battery_energy < self.E_min:
+            penalty_soc += (self.E_min - self.battery_energy) ** 2  # Quadratic penalty for over-discharging
+            self.battery_energy = self.E_min  # Prevent falling below min limit
+            
+        """
+            A penalty function focused on SOC management, designed to penalize the system when 
+            SOC deviates from the optimal range, either becoming too low or exceeding a safe threshold.
+            
+            ^^ Quadratic penalties align well with this concept, as they impose progressively 
+            higher penalties for deviations farther from the optimal range.
+        """
+        
+        return penalty_soc  # Return SOC penalty to include in reward
+            
+        
 
 
 
