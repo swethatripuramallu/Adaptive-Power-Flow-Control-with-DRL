@@ -68,7 +68,7 @@ mpc.gen(5,3) = Qw;
 % results 
 results = runpf(mpc); 
 losses = get_losses(results); 
-system_loss = sum(real(losses)); 
+system_loss = sum((losses)); 
  
 bus_voltages = mpc.bus(:,8); 
 bus_voltage_angle = mpc.bus(:,9); 

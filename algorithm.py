@@ -3,10 +3,11 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from scipy.io import loadmat
-from pypower.api import runpf, loadcase, get_losses, real
+from pypower.api import runpf, loadcase
 import matlab.engine
 import csv
 import h5py
+import datetime
 
 
 # Utility: Check if GPU is available
@@ -52,8 +53,8 @@ class PyPowerEnv:
         """
         Construct the MATPOWER case (mpc) for the current episode using the training data.
         """
-        current_data = self.training_data[self.episodes % self.training_data.shape[0], :]
-        print(f"Current training row: {current_data}")
+        # current_data = self.training_data[self.episodes % self.training_data.shape[0], :]
+        # print(f"Current training row: {current_data}")
 
         # Load the MATPOWER case
         mpc = loadcase(self.case_file)
@@ -101,7 +102,7 @@ class PyPowerEnv:
             # Extract renewable generation (Pw and Ppv)
             P_gen = results["gen"][:, 1]  # Active power generation
             P_w = P_gen[4]  # Wind generator (assuming it's at index 4)
-            P_pv = P_gen[1:3]  # Solar generators (assuming indices 1 and 2)
+            P_pv = P_gen[1:2]  # Solar generators (assuming indices 1 and 2)
 
             # Include battery SOC
             battery_soc = self.battery_energy
@@ -149,20 +150,30 @@ class PyPowerEnv:
         mpc["gen"][2, 2] = action[3]  # Qpv2 (reactive power for solar at gen 3)
         mpc["gen"][4, 2] = action[4]  # Qw (reactive power for wind at gen 5)
 
+        # Convert Python dictionary to MATLAB struct
+        # mpc_matlab = self.dict_to_matlab_struct(mpc)
         # Run the power flow analysis
         try:
-            results = runpf(mpc)
+            # Start MATLAB Engine
+            eng = matlab.engine.start_matlab()
+
+            # Run power flow using MATLAB
+            # mpc_matlab = eng.struct(mpc)  # Convert Python dictionary to MATLAB struct
+            results, success = runpf(mpc, ppopt = None)
+            if not success:
+                raise ValueError("Power flow did not converge in MATLAB.")
 
             # Power loss
-            losses = get_losses(results)
-            system_loss = sum(real(losses))  # Real power losses
+            losses = eng.get_losses(results)  # Use MATLAB's get_losses function
+            losses_real = [float(eng.real(loss)) for loss in losses]  # Convert MATLAB complex array to Python real numbers
+            system_loss = sum(losses_real)  # Total real power losses
             Ploss_penalty = system_loss  # Direct penalty for power losses
 
             # Voltage penalties
-            voltage = results["bus"][:, 7]  # Voltage magnitudes
+            voltage = np.array(results["bus"][:, 7])  # Voltage magnitudes
             voltage_penalty = np.sum((voltage < self.V_min) | (voltage > self.V_max))
 
-            # SOC deviation penalty (e.g., penalize deviation from mid-range SOC)
+            # SOC deviation penalty
             optimal_soc = (self.E_max + self.E_min) / 2
             soc_deviation_penalty = abs(self.battery_energy - optimal_soc) ** 2
 
@@ -170,16 +181,19 @@ class PyPowerEnv:
             reward = -Ploss_penalty - soc_penalty - voltage_penalty - soc_deviation_penalty
 
             # Create the next state
-            P_load = results["bus"][:, 2]
-            Q_load = results["bus"][:, 3]
-            P_gen = results["gen"][:, 1]
-            P_w = P_gen[4]
-            P_pv = P_gen[1:3]
+            P_load = np.array(results["bus"][:, 2])  # Active power demands
+            Q_load = np.array(results["bus"][:, 3])  # Reactive power demands
+            P_gen = np.array(results["gen"][:, 1])  # Active power generation
+            P_w = P_gen[4]  # Wind generator
+            P_pv = P_gen[1:3]  # Solar generators
             battery_soc = self.battery_energy
             next_state = np.concatenate([P_load, Q_load, P_pv, [P_w], [battery_soc]])
 
             # Check if episode is complete
             self.done = self.current_step >= self.max_steps
+
+            # Close MATLAB engine
+            eng.quit()
 
             return next_state, reward, self.done, {
                 "battery_energy": self.battery_energy,
@@ -216,24 +230,6 @@ class PyPowerEnv:
         """
         
         return penalty_soc  # Return SOC penalty to include in reward
-            
-        
-
-
-
-def train(env, agent, episodes=1090):
-    """Train the PPO agent."""
-    for episode in range(episodes):
-        state = env.reset()
-        total_reward = 0
-        for step in range(env.max_steps):
-            action = agent.select_action(state)
-            next_state, reward, done, info = env.step(action)
-            total_reward += reward
-            if done:
-                break
-            state = next_state
-        print(f"Episode {episode + 1}/{episodes}, Total Reward: {total_reward:.2f}")
 
 
 # Actor and Critic Network definitions (same as before)
@@ -343,13 +339,14 @@ def setup_environment_and_agent(case_file):
 def train_agent(agent, env, episodes=1090):
     """Train the PPO agent on the environment."""
     # Initialize logs as Python lists
-    step_log = [["Episode", "Hour", "Action", "Battery_Energy", "System_Loss"]]
-    episode_log = [["Episode", "Total_Reward", "Total_Loss"]]
+    step_log = [["Date", "Episode", "Hour", "Action", "Battery_Energy", "System_Loss"]]
+    episode_log = [["Date", "Episode", "Total_Reward", "Total_Loss"]]
 
     for episode in range(episodes):
         state = env.reset()  # Reset the environment at the start of each episode
         episode_reward = 0
         episode_loss = 0
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")  # Capture today's date
 
         for hour in range(env.max_steps):  # Iterate over the max steps (e.g., 24 for a day)
             action = agent.select_action(state)  # Get action from the agent
@@ -357,6 +354,7 @@ def train_agent(agent, env, episodes=1090):
 
             # Append step details to the log
             step_log.append([
+                current_date,  # Current date
                 episode + 1,  # Episode number
                 hour + 1,  # Hour within the episode
                 action.tolist(),  # Action taken
@@ -364,16 +362,17 @@ def train_agent(agent, env, episodes=1090):
                 info.get("system_loss", 0),  # System losses
             ])
 
-        # Update episode metrics
-        episode_reward += reward
-        episode_loss += info.get("system_loss", 0)
-        state = next_state
+            # Update cumulative metrics
+            episode_reward += reward
+            episode_loss += info.get("system_loss", 0)
+            state = next_state
 
-        if done:  # Stop the episode if the environment signals completion
-            break
+            if done:  # Stop the episode if the environment signals completion
+                break
 
         # Append episode summary to the log
         episode_log.append([
+            current_date,  # Current date
             episode + 1,  # Episode number
             episode_reward,  # Total reward for the episode
             episode_loss,  # Total loss for the episode
