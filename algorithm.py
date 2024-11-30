@@ -3,11 +3,14 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from scipy.io import loadmat
-from pypower.api import runpf, loadcase
-import matlab.engine
+from pypower.api import runpf, loadcase, ppoption
 import csv
 import h5py
 import datetime
+import sys
+from contextlib import redirect_stdout
+import io
+import traceback
 
 
 # Utility: Check if GPU is available
@@ -25,25 +28,22 @@ class PyPowerEnv:
         self.max_steps = max_steps
         self.current_step = 0
         self.episodes = 0
-        self.training_data = self.load_training_data()
         self.battery_energy = 2.0  # Initial SOC (MWh)
         self.mu_b = 0.98  # Charging/discharging efficiency
         self.state = None
         self.done = False
-
         # Power system constraints
         self.P_bss_min, self.P_bss_max = -2, 2  # MW
         self.E_max, self.E_min = 3.6, 0.8  # MWh
+        self.V_min = 1.06; 
+        self.V_max = 0.94; 
+        
+        self.training_data = self.load_training_data()
 
     def load_training_data(self):
-        """Load training data using MATLAB Engine."""
         try:
-            print(f"Loading training data from: {self.training_data_file}")
-            eng = matlab.engine.start_matlab()
-            training_data = eng.load(self.training_data_file)["training_data"]
-            training_data = np.array(training_data)  # Convert to NumPy array
-            print(f"Training data loaded successfully. Shape: {training_data.shape}")
-            eng.quit()
+            training_data = loadmat(self.training_data_file)
+            training_data = training_data["training_data"]
             return training_data
         except Exception as e:
             print(f"Error loading training data: {e}")
@@ -53,8 +53,10 @@ class PyPowerEnv:
         """
         Construct the MATPOWER case (mpc) for the current episode using the training data.
         """
-        # current_data = self.training_data[self.episodes % self.training_data.shape[0], :]
-        # print(f"Current training row: {current_data}")
+        
+        row_index = ( (self.episodes) * self.max_steps + (self.current_step)) % self.training_data.shape[0]
+        current_data = self.training_data[row_index, :]
+        print(f"Current training row (Episode {self.episodes}, Step {self.current_step}): {current_data}")
 
         # Load the MATPOWER case
         mpc = loadcase(self.case_file)
@@ -83,18 +85,31 @@ class PyPowerEnv:
         self.current_step = 0
         self.done = False
         self.battery_energy = 2.0
+        self.episodes += 1
         self.state = self.get_initial_state()
         return self.state
 
+   
     def get_initial_state(self):
         """Run power flow and return the initial state based on load demands, generation, and battery SOC."""
         try:
+            # Get the mpc case
             mpc = self.get_mpc()
-            results, success = runpf(mpc)
+
+            # Ensure mpc data is in the correct format
+            mpc["bus"] = np.array(mpc["bus"], dtype=np.float64)
+            mpc["branch"] = np.array(mpc["branch"], dtype=np.float64)
+            mpc["gen"] = np.array(mpc["gen"], dtype=np.float64)
+
+            # Suppress verbose output
+            ppopt = ppoption(VERBOSE=0, OUT_ALL=0)
+
+            # Run power flow
+            results, success = runpf(mpc, ppopt=ppopt)
             if not success:
                 print("Power flow failed. Returning default state.")
                 return np.zeros(2 * len(mpc["bus"]) + len(mpc["gen"]) + 1)  # Default state dimension
-            
+
             # Extract load demands (Pload and Qload)
             P_load = results["bus"][:, 2]  # Active power demand
             Q_load = results["bus"][:, 3]  # Reactive power demand
@@ -109,11 +124,46 @@ class PyPowerEnv:
 
             # Combine all into the state vector
             state = np.concatenate([P_load, Q_load, P_pv, [P_w], [battery_soc]])
+            print(f"state shape {state.shape}")
             return state
         except Exception as e:
+            state_dim = 2 * len(mpc["bus"]) + len(mpc["gen"]) + 1
+            print(f"Returning fallback state of dimension {state_dim} due to error.")
             print(f"Error during power flow: {e}")
-            return np.zeros(2 * len(mpc["bus"]) + len(mpc["gen"]) + 1)
+            return np.zeros(state_dim)
+        
+    def get_losses(self, results):
+        """
+        Calculate power losses from the results dictionary.
 
+        Parameters:
+            results (dict): Dictionary containing power flow results.
+                            Expected to include 'branch' key with branch data.
+
+        Returns:
+            dict: Total real power losses (P_loss) and reactive power losses (Q_loss).
+        """
+        if 'branch' not in results:
+            raise ValueError("Results dictionary must include 'branch' key.")
+        
+        # Extract branch data
+        # Branch columns: From bus, To bus, ..., P_from, Q_from, P_to, Q_to
+        branch_data = results['branch']
+
+        # Indices for power columns (assuming MATPOWER-like format)
+        P_from_col = 13  # Active power flow (from)
+        Q_from_col = 14  # Reactive power flow (from)
+        P_to_col = 15    # Active power flow (to)
+        Q_to_col = 16    # Reactive power flow (to)
+
+        # Calculate real and reactive power losses for each branch
+        P_loss = np.sum(np.abs(branch_data[:, P_from_col] - branch_data[:, P_to_col]))
+        Q_loss = np.sum(np.abs(branch_data[:, Q_from_col] - branch_data[:, Q_to_col]))
+
+        return {
+            "P_loss": P_loss,  # Total active power loss
+            "Q_loss": Q_loss   # Total reactive power loss
+        }
 
     def step(self, action):
         """
@@ -130,8 +180,6 @@ class PyPowerEnv:
         Returns:
             tuple: (next_state, reward, done, info)
         """
-        if self.done:
-            raise RuntimeError("Environment is done. Reset to start a new episode.")
 
         self.current_step += 1
 
@@ -149,28 +197,37 @@ class PyPowerEnv:
         mpc["gen"][1, 2] = action[2]  # Qpv1 (reactive power for solar at gen 2)
         mpc["gen"][2, 2] = action[3]  # Qpv2 (reactive power for solar at gen 3)
         mpc["gen"][4, 2] = action[4]  # Qw (reactive power for wind at gen 5)
+    
 
-        # Convert Python dictionary to MATLAB struct
-        # mpc_matlab = self.dict_to_matlab_struct(mpc)
         # Run the power flow analysis
         try:
-            # Start MATLAB Engine
-            eng = matlab.engine.start_matlab()
-
-            # Run power flow using MATLAB
-            # mpc_matlab = eng.struct(mpc)  # Convert Python dictionary to MATLAB struct
-            results, success = runpf(mpc, ppopt = None)
+            # # Suppress PyPower output
+            ppopt = ppoption(VERBOSE=0, OUT_ALL=0)
+            
+            # Redirect stdout to suppress PyPower output
+            with io.StringIO() as buf, redirect_stdout(buf):
+                results, success = runpf(mpc, ppopt = ppopt)
+            
             if not success:
-                raise ValueError("Power flow did not converge in MATLAB.")
-
+                raise ValueError("Power flow did not converge.")
+            
             # Power loss
-            losses = eng.get_losses(results)  # Use MATLAB's get_losses function
-            losses_real = [float(eng.real(loss)) for loss in losses]  # Convert MATLAB complex array to Python real numbers
-            system_loss = sum(losses_real)  # Total real power losses
-            Ploss_penalty = system_loss  # Direct penalty for power losses
+            losses = self.get_losses(results)  # Use get_losses function          
+            
+            # Extract real power losses from the losses dictionary
+            losses_real = losses["P_loss"]
 
+            # Calculate the system loss (total real power loss)
+            system_loss = losses_real
+
+            # Assign the real power loss as a penalty for power losses
+            Ploss_penalty = system_loss
+            
             # Voltage penalties
-            voltage = np.array(results["bus"][:, 7])  # Voltage magnitudes
+            voltage = results["bus"][:, 7]  # Voltage magnitudes
+            
+            print("Type of voltage array:", type(voltage))
+            
             voltage_penalty = np.sum((voltage < self.V_min) | (voltage > self.V_max))
 
             # SOC deviation penalty
@@ -181,20 +238,21 @@ class PyPowerEnv:
             reward = -Ploss_penalty - soc_penalty - voltage_penalty - soc_deviation_penalty
 
             # Create the next state
-            P_load = np.array(results["bus"][:, 2])  # Active power demands
-            Q_load = np.array(results["bus"][:, 3])  # Reactive power demands
-            P_gen = np.array(results["gen"][:, 1])  # Active power generation
+            P_load = results["bus"][:, 2]  # Active power demands
+            Q_load = results["bus"][:, 3]  # Reactive power demands
+            P_gen = results["gen"][:, 1] # Active power generation
             P_w = P_gen[4]  # Wind generator
-            P_pv = P_gen[1:3]  # Solar generators
+            P_pv = P_gen[1:2]  # Solar generators
             battery_soc = self.battery_energy
             next_state = np.concatenate([P_load, Q_load, P_pv, [P_w], [battery_soc]])
+            print(f"Next state shape: {next_state.shape}")
 
             # Check if episode is complete
             self.done = self.current_step >= self.max_steps
-
-            # Close MATLAB engine
-            eng.quit()
-
+            
+            #logging
+            print(f"Episode {self.episodes + 1}, Hour {self.current_step + 1}, Done: {self.done}")
+            
             return next_state, reward, self.done, {
                 "battery_energy": self.battery_energy,
                 "system_loss": system_loss,
@@ -202,12 +260,12 @@ class PyPowerEnv:
                 "voltage_penalty": voltage_penalty,
             }
         except Exception as e:
-            print(f"Error during power flow: {e}")
+            print(f"Error during power flow in step function: {e}")
+            traceback.print_exc()
             reward = -1.0  # Penalty for exception
             self.done = True
             return np.zeros_like(self.state), reward, self.done, {"battery_energy": self.battery_energy}
-
-
+        
     def update_battery(self, P_b):
         """Update the battery SOC based on the action."""
         self.battery_energy += self.mu_b * P_b
@@ -246,6 +304,7 @@ class ActorNetwork(nn.Module):
         )
 
     def forward(self, state):
+        state = state.view(1, -1)  # Ensures correct shape (batch_size=1, input_dim=32)
         return self.fc(state)
     
 class CriticNetwork(nn.Module):
@@ -325,7 +384,7 @@ def setup_environment_and_agent(case_file):
         if env.state is None:
             raise ValueError("The environment's state is None. Check the PyPowerEnv setup.")
 
-        state_dim = len(env.state) if env.state is not None else 0
+        state_dim = (len(env.state)) if env.state is not None else 0
         action_dim = 5
         print(f"State dimension: {state_dim}, Action dimension: {action_dim}")
         agent = PPOAgent(state_dim, action_dim)
@@ -336,7 +395,7 @@ def setup_environment_and_agent(case_file):
         raise
 
 
-def train_agent(agent, env, episodes=1090):
+def train_agent(agent, env, episodes=2):
     """Train the PPO agent on the environment."""
     # Initialize logs as Python lists
     step_log = [["Date", "Episode", "Hour", "Action", "Battery_Energy", "System_Loss"]]
@@ -380,11 +439,11 @@ def train_agent(agent, env, episodes=1090):
         print(f"Episode {episode + 1}: Total Reward = {episode_reward:.2f}, Total Loss = {episode_loss:.2f}")
 
     # Write logs to CSV files using the csv module
-    with open("step_log_case1.csv", "w", newline="") as step_file:
+    with open("step_log_case_training.csv", "w", newline="") as step_file:
         writer = csv.writer(step_file)
         writer.writerows(step_log)
 
-    with open("episode_log_case1.csv", "w", newline="") as episode_file:
+    with open("episode_log_case_training.csv", "w", newline="") as episode_file:
         writer = csv.writer(episode_file)
         writer.writerows(episode_log)
 
@@ -404,7 +463,7 @@ def main(case_file, training_data_file, episodes=1090):
 
         # Initialize the environment and the agent
         env = PyPowerEnv(case_file, training_data_file)
-        state_dim = len(env.get_initial_state())
+        state_dim = len(env.get_initial_state()) 
         action_dim = 5  # 5 actions as per the step function
 
         # Initialize PPO agent
@@ -415,8 +474,11 @@ def main(case_file, training_data_file, episodes=1090):
         train_agent(agent, env, episodes)
 
         print("Training completed successfully!")
+        
     except Exception as e:
         print(f"An error occurred during the setup or training process: {e}")
+        traceback.print_exc()
+        
 
 
 # Example usage
@@ -425,3 +487,4 @@ if __name__ == "__main__":
     training_data_file = "training_data.mat"  # Replace with the actual path to training_data.mat
 
     main(case_file, training_data_file)
+    
