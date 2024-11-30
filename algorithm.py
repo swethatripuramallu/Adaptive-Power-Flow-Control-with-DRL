@@ -22,9 +22,10 @@ class PyPowerEnv:
     """
     PyPower Environment for RL-based power flow optimization.
     """
-    def __init__(self, case_file, training_data_file, max_steps=24):
+    def __init__(self, case_file, training_data_file, testing_data_file, mode, max_steps=24):
         self.case_file = case_file
         self.training_data_file = training_data_file
+        self.testing_data_file = testing_data_file
         self.max_steps = max_steps
         self.current_step = 0
         self.episodes = 0
@@ -32,6 +33,7 @@ class PyPowerEnv:
         self.mu_b = 0.98  # Charging/discharging efficiency
         self.state = None
         self.done = False
+        self.mode = mode
         # Power system constraints
         self.P_bss_min, self.P_bss_max = -2, 2  # MW
         self.E_max, self.E_min = 3.6, 0.8  # MWh
@@ -39,24 +41,45 @@ class PyPowerEnv:
         self.V_max = 0.94; 
         
         self.training_data = self.load_training_data()
+        self.testing_data = self.load_testing_data()
 
     def load_training_data(self):
         try:
             training_data = loadmat(self.training_data_file)
+            print("Keys in the .mat file:", training_data.keys())
             training_data = training_data["training_data"]
             return training_data
         except Exception as e:
             print(f"Error loading training data: {e}")
+            raise
+        
+    def load_testing_data(self):
+        try:
+            testing_data = loadmat(self.testing_data_file)
+            print("Keys in the .mat file:", testing_data.keys())
+            testing_data = testing_data["test_data"]
+            return testing_data
+        except Exception as e:
+            print(f"Error loading testing data: {e}")
             raise
 
     def get_mpc(self):
         """
         Construct the MATPOWER case (mpc) for the current episode using the training data.
         """
+        # Select the appropriate dataset based on the mode
+        if self.mode == "train":
+            data = self.training_data
+        elif self.mode == "test":
+            data = self.testing_data
+        else:
+            raise ValueError(f"Invalid mode: {self.mode}. Use 'train' or 'test'.")
         
-        row_index = ( (self.episodes) * self.max_steps + (self.current_step)) % self.training_data.shape[0]
-        current_data = self.training_data[row_index, :]
-        print(f"Current training row (Episode {self.episodes}, Step {self.current_step}): {current_data}")
+        # Ensure row_index does not exceed the size of the data
+        total_rows = data.shape[0]
+        row_index = (self.episodes * self.max_steps + self.current_step) % total_rows
+        current_data = data[row_index, :]
+        print(f"Current row (Mode: {self.mode}, Episode {self.episodes}, Step {self.current_step}): {current_data}")
 
         # Load the MATPOWER case
         mpc = loadcase(self.case_file)
@@ -395,7 +418,7 @@ def setup_environment_and_agent(case_file):
         raise
 
 
-def train_agent(agent, env, episodes=2):
+def train_agent(agent, env, episodes=4):
     """Train the PPO agent on the environment."""
     # Initialize logs as Python lists
     step_log = [["Date", "Episode", "Hour", "Action", "Battery_Energy", "System_Loss"]]
@@ -439,11 +462,11 @@ def train_agent(agent, env, episodes=2):
         print(f"Episode {episode + 1}: Total Reward = {episode_reward:.2f}, Total Loss = {episode_loss:.2f}")
 
     # Write logs to CSV files using the csv module
-    with open("step_log_case_training.csv", "w", newline="") as step_file:
+    with open("step_log_case_training2.csv", "w", newline="") as step_file:
         writer = csv.writer(step_file)
         writer.writerows(step_log)
 
-    with open("episode_log_case_training.csv", "w", newline="") as episode_file:
+    with open("episode_log_case_training2.csv", "w", newline="") as episode_file:
         writer = csv.writer(episode_file)
         writer.writerows(episode_log)
 
@@ -480,11 +503,106 @@ def main(case_file, training_data_file, episodes=1090):
         traceback.print_exc()
         
 
+def test_agent(agent, env, episodes=5):
+    """Test the PPO agent on a separate dataset."""
+    # Initialize logs as Python lists
+    step_log = [["Date", "Episode", "Hour", "Action", "Reward", "Battery_Energy", "System_Loss", "Voltage_Penalty"]]
+    episode_log = [["Date", "Episode", "Total_Reward"]]
+
+    for episode in range(episodes):
+        state = env.reset()  # Reset the environment at the start of each episode
+        episode_reward = 0
+        current_date = datetime.datetime.now().strftime("%Y-%m-%d")  # Capture today's date
+
+        for hour in range(env.max_steps):  # Iterate over the max steps (e.g., 24 for a day)
+            action = agent.select_action(state)  # Get action from the agent
+            next_state, reward, done, info = env.step(action)  # Take a step in the environment
+
+            # Append step details to the log
+            step_log.append([
+                current_date,  # Current date
+                episode + 1,  # Episode number
+                hour + 1,  # Hour within the episode
+                action.tolist(),  # Action taken
+                reward,  # Reward received
+                info.get("battery_energy", 0),  # Battery energy state
+                info.get("system_loss", 0),  # System losses
+                info.get("voltage_penalty", 0),  # Voltage penalty
+            ])
+
+            # Update cumulative metrics
+            episode_reward += reward
+            state = next_state
+
+            if done:  # Stop the episode if the environment signals completion
+                break
+
+        # Append episode summary to the log
+        episode_log.append([
+            current_date,  # Current date
+            episode + 1,  # Episode number
+            episode_reward,  # Total reward for the episode
+        ])
+        print(f"Episode {episode + 1}: Total Reward = {episode_reward:.2f}")
+
+    # Write logs to CSV files using the csv module
+    with open("step_log_case_testing.csv", "w", newline="") as step_file:
+        writer = csv.writer(step_file)
+        writer.writerows(step_log)
+
+    with open("episode_log_case_testing.csv", "w", newline="") as episode_file:
+        writer = csv.writer(episode_file)
+        writer.writerows(episode_log)
+
+    print("Testing complete. Logs saved to 'step_log_case_testing.csv' and 'episode_log_case_testing.csv'.")
+
+
+def main_with_testing(case_file, testing_data_file, training_data_file, train_episodes = 1090, test_episodes=5):
+    """
+    Main function to set up and run the PyPowerEnv with PPO training and testing.
+
+    Parameters:
+        case_file (str): Path to the MATPOWER case file (e.g., case14.m).
+        training_data_file (str): Path to the .mat file containing training data.
+        testing_data_file (str): Path to the .mat file containing testing data.
+        train_episodes (int): Number of episodes for training.
+        test_episodes (int): Number of episodes for testing.
+    """
+    try:
+        print(f"Initializing environment with case file: {case_file}")
+        
+        # # Training Phase
+        # env_train = PyPowerEnv(case_file, training_data_file, testing_data_file)
+        
+
+        # agent = PPOAgent(state_dim, action_dim)
+        # print("Starting training...")
+        # train_agent(agent, env_train, train_episodes)
+
+        # print("Training completed successfully!")
+
+        # Testing Phase
+        print("Starting testing...")
+        mode = 'test'
+        env_test = PyPowerEnv(case_file, training_data_file, testing_data_file, mode)
+        state_dim = len(env_test.get_initial_state())
+        action_dim = 5
+        agent = PPOAgent(state_dim, action_dim)
+        test_agent(agent, env_test)
+
+        print("Testing completed successfully!")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+        traceback.print_exc()
+
 
 # Example usage
 if __name__ == "__main__":
     case_file = "case14mod.mat"  # Replace with the actual path to case14.m
     training_data_file = "training_data.mat"  # Replace with the actual path to training_data.mat
+    testing_data_file = "test_data.mat"
 
-    main(case_file, training_data_file)
+    # main(case_file, training_data_file)
+    main_with_testing(case_file, testing_data_file, training_data_file)
     
