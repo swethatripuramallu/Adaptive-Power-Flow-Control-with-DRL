@@ -11,6 +11,7 @@ import sys
 from contextlib import redirect_stdout
 import io
 import traceback
+import matlab.engine
 
 
 # Utility: Check if GPU is available
@@ -171,78 +172,78 @@ class PyPowerEnv:
         
         # Extract branch data
         # Branch columns: From bus, To bus, ..., P_from, Q_from, P_to, Q_to
-        # branch_data = results['branch']
-
-        # # Indices for power columns (assuming MATPOWER-like format)
-       
-        # P_from_col = 13  # Active power flow (from)
-        # Q_from_col = 14  # Reactive power flow (from)
-        # P_to_col = 15    # Active power flow (to)
-        # Q_to_col = 16    # Reactive power flow (to)
-
-        # # Calculate real and reactive power losses for each branch
-        # P_loss = np.sum(branch_data[:, P_from_col] + branch_data[:, P_to_col])
-        # Q_loss = np.sum(branch_data[:, Q_from_col] + branch_data[:, Q_to_col])
-        
-        # print(f"P_loss: {P_loss}\n")
-
-        # return {
-        #     "P_loss": P_loss,  # Total active power loss
-        #     "Q_loss": Q_loss   # Total reactive power loss
-        # }
         branch_data = results['branch']
-        bus_voltages = results['bus'][:, 7] * np.exp(1j * np.radians(results['bus'][:, 8]))  # Vm * exp(j * Va)
 
-        # Indices for branch data
-        F_BUS = 0    # From bus index
-        T_BUS = 1    # To bus index
-        R_col = 2    # Resistance
-        X_col = 3    # Reactance
-        B_col = 4    # Line charging susceptance
-        TAP = 8      # Transformer tap ratio (if exists)
-        SHIFT = 9    # Phase shift angle
+        # Indices for power columns (assuming MATPOWER-like format)
+       
+        P_from_col = 13  # Active power flow (from)
+        Q_from_col = 14  # Reactive power flow (from)
+        P_to_col = 15    # Active power flow (to)
+        Q_to_col = 16    # Reactive power flow (to)
 
-        # Initialize total losses
-        total_real_power_loss = 0.0
-        total_reactive_power_loss = 0.0
-        branch_losses = []
-       # loss = abs( Vf / tau - Vt ) ^ 2 / (Rs - j Xs ) 
-        for branch in branch_data:
-            # Extract branch parameters
-            f_bus = int(branch[F_BUS]) - 1  # Convert 1-based to 0-based index
-            t_bus = int(branch[T_BUS]) - 1
-            R = branch[R_col]
-            X = branch[X_col]
-            tau = branch[TAP] if branch[TAP] != 0 else 1.0
-            shift = np.radians(branch[SHIFT])
-
-            # Complex impedance and admittance
-            Z = R + 1j * X
-            Y = 1 / Z
-
-            # Voltages at "from" and "to" buses
-            Vf = bus_voltages[f_bus] / tau * np.exp(1j * shift)
-            Vt = bus_voltages[t_bus]
-
-            # Calculate losses using the formula
-            delta_V = Vf - Vt
-            loss = np.abs(delta_V)**2 * Y
-            branch_real_loss = np.real(loss)
-            branch_reactive_loss = np.imag(loss)
-
-            # Accumulate total losses
-            total_real_power_loss += branch_real_loss
-            total_reactive_power_loss += branch_reactive_loss
-            branch_losses.append((branch_real_loss, branch_reactive_loss))
-            
-        print(f"P_loss: {total_real_power_loss}\n")
+        # Calculate real and reactive power losses for each branch
+        P_loss = np.sum(np.abs(branch_data[:, P_from_col]) - np.abs(branch_data[:, P_to_col]))
+        Q_loss = np.sum(np.abs(branch_data[:, Q_from_col]) - np.abs(branch_data[:, Q_to_col]))
+        
+        print(f"P_loss: {P_loss}\n")
 
         return {
-            "P_loss": total_real_power_loss,  # Total real power loss
-            "Q_loss": total_reactive_power_loss,  # Total reactive power loss
-            "branch_losses": branch_losses  # Per-branch losses
+            "P_loss": P_loss,  # Total active power loss
+            "Q_loss": Q_loss   # Total reactive power loss
         }
+    #     branch_data = results['branch']
+    #     bus_voltages = results['bus'][:, 7] * np.exp(1j * np.radians(results['bus'][:, 8]))  # Vm * exp(j * Va)
+
+    #     # Indices for branch data
+    #     F_BUS = 0    # From bus index
+    #     T_BUS = 1    # To bus index
+    #     R_col = 2    # Resistance
+    #     X_col = 3    # Reactance
+    #     B_col = 4    # Line charging susceptance
+    #     TAP = 8      # Transformer tap ratio (if exists)
+    #     SHIFT = 9    # Phase shift angle
+
+    #     # Initialize total losses
+    #     total_real_power_loss = 0.0
+    #     total_reactive_power_loss = 0.0
+    #     branch_losses = []
+    #    # loss = abs( Vf / tau - Vt ) ^ 2 / (Rs - j Xs ) 
+    #     for branch in branch_data:
+    #         # Extract branch parameters
+    #         f_bus = int(branch[F_BUS]) - 1  # Convert 1-based to 0-based index
+    #         t_bus = int(branch[T_BUS]) - 1
+    #         R = branch[R_col]
+    #         X = branch[X_col]
+    #         tau = branch[TAP] if branch[TAP] != 0 else 1.0
+    #         shift = np.radians(branch[SHIFT])
+
+    #         # Complex impedance and admittance
+    #         Z = R + 1j * X
+    #         Y = 1 / Z
+
+    #         # Voltages at "from" and "to" buses
+    #         Vf = bus_voltages[f_bus] / tau * np.exp(1j * shift)
+    #         Vt = bus_voltages[t_bus]
+
+    #         # Calculate losses using the formula
+    #         delta_V = Vf - Vt
+    #         loss = np.abs(delta_V)**2 * Y
+    #         branch_real_loss = np.real(loss)
+    #         branch_reactive_loss = np.imag(loss)
+
+    #         # Accumulate total losses
+    #         total_real_power_loss += branch_real_loss
+    #         total_reactive_power_loss += branch_reactive_loss
+    #         branch_losses.append((branch_real_loss, branch_reactive_loss))
             
+    #     print(f"P_loss: {total_real_power_loss}\n")
+
+    #     return {
+    #         "P_loss": total_real_power_loss,  # Total real power loss
+    #         "Q_loss": total_reactive_power_loss,  # Total reactive power loss
+    #         "branch_losses": branch_losses  # Per-branch losses
+    #     }
+          
 
     def step(self, action):
         """
@@ -296,9 +297,9 @@ class PyPowerEnv:
             # Extract real power losses from the losses dictionary
             losses_real = losses["P_loss"]
 
-            # Calculate the system loss (total real power loss)
+            # # Calculate the system loss (total real power loss)
             system_loss = losses_real
-
+            
             # Assign the real power loss as a penalty for power losses
             Ploss_penalty = system_loss
             
@@ -605,11 +606,11 @@ def test_agent(agent, env, episodes=5):
         print(f"Episode {episode + 1}: Total Reward = {episode_reward:.2f}")
 
     # Write logs to CSV files using the csv module
-    with open("step_log_case_testing.csv", "w", newline="") as step_file:
+    with open("step_log_case_testing_trial.csv", "w", newline="") as step_file:
         writer = csv.writer(step_file)
         writer.writerows(step_log)
 
-    with open("episode_log_case_testing.csv", "w", newline="") as episode_file:
+    with open("episode_log_case_testing_trial.csv", "w", newline="") as episode_file:
         writer = csv.writer(episode_file)
         writer.writerows(episode_log)
 
@@ -636,8 +637,8 @@ def main_with_testing(case_file, testing_data_file, training_data_file, train_ep
         state_dim = len(env_train.get_initial_state())
         action_dim = 5
         agent = PPOAgent(state_dim, action_dim)
-        print("Starting training...")
-        train_agent(agent, env_train, train_episodes)
+        # print("Starting training...")
+        # train_agent(agent, env_train, train_episodes)
 
         # print("Training completed successfully!")
 
@@ -645,7 +646,7 @@ def main_with_testing(case_file, testing_data_file, training_data_file, train_ep
         # print("Starting testing...")
         # mode = 'test'
         # agent = PPOAgent(state_dim, action_dim)
-        # test_agent(agent, env_train)
+        test_agent(agent, env_train)
 
         # print("Testing completed successfully!")
 

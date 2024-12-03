@@ -21,26 +21,30 @@ clc
 % V_min = 1.06; 
 % V_max = 0.94; 
 
-mpc = loadcase(case14);
+addpath('C:\Users\sweth\Downloads\matpower8.0\matpower8.0')
+savepath;
+
+mpc = loadcase('case14');
 % for each training step 
-Pload1 = 47.8;
-Qload1 = -3.9;
-Pload2 = 7.6;
-Qload2 = 1.6; 
-Pload3 = 29.5;
-Qload3 = 16.6;
-Pload4 = 9; 
-Qload4 = 5.8;
-Pload5 = 3.5;
-Qload5 = 1.8;
-Pload6 = 6.1;
-Qload6 = 1.6;
-Pload7 = 13.5;
-Qload7 = 5.8;
-Pload8 = 14.9;
-Qload8 = 5; 
-Ppv = 5; 
-Pw = 1; 
+Pload1 = 15.2900000000000;
+Qload1 = 3.83203500000000;
+Pload2 = 6.89200000000000;
+Qload2 = 3.33794794700000; 
+Pload3 = 4.91600000000000;
+Qload3 = 1.94292752200000;
+Pload4 = 5.04000000000000; 
+Qload4 = 2.29629184000000;
+Pload5 = 4.16300000000000;
+Qload5 = 14.0960000000000;
+Pload6 = 14.0960000000000;
+Qload6 = 6.42232733600000;
+Pload7 = 17.0810000000000;
+Qload7 = 6.75084316500000;
+Pload8 = 7.13600000000000;
+Qload8 = 2.82032766400000; 
+			
+Ppv = 0; 
+Pw = 0; 
 % obtain generation from solar and wind and load for all buses 
 mpc.bus(4,3:4) = [Pload1 Qload1]; 
 mpc.bus(5,3:4) = [Pload2 Qload2];
@@ -54,11 +58,13 @@ mpc.gen(2,2) = Ppv;
 mpc.gen(3,2) = Ppv; 
 mpc.gen(5,2) = Pw; 
 % Obtain actions from agent 
-Pbss = 1; 
-Qbss = 0.5; 
-Qw = 0.5; 
-Qpv1 = 7; 
-Qpv2 = 7; 
+Pbss = -0.5263738036155701; 
+Qbss = 0.22232136130332947; 
+Qw = 0.1125740334391594; 
+Qpv1 = -0.1310410499572754; 
+Qpv2 = 0.813401997089386; 
+
+
 % Update power flow casefile with obtained actions 
 mpc.gen(4,2) = Pbss; 
 mpc.gen(4,3) = Qbss; 
