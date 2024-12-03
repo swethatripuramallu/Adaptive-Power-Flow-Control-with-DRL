@@ -180,8 +180,8 @@ class PyPowerEnv:
         Q_to_col = 16    # Reactive power flow (to)
 
         # Calculate real and reactive power losses for each branch
-        P_loss = np.sum(np.abs(branch_data[:, P_from_col] - branch_data[:, P_to_col]))
-        Q_loss = np.sum(np.abs(branch_data[:, Q_from_col] - branch_data[:, Q_to_col]))
+        P_loss = np.sum(np.abs(branch_data[:, P_from_col]) - np.abs(branch_data[:, P_to_col]))
+        Q_loss = np.sum(np.abs(branch_data[:, Q_from_col]) - np.abs(branch_data[:, Q_to_col]))
 
         return {
             "P_loss": P_loss,  # Total active power loss
@@ -507,11 +507,12 @@ def test_agent(agent, env, episodes=5):
     """Test the PPO agent on a separate dataset."""
     # Initialize logs as Python lists
     step_log = [["Date", "Episode", "Hour", "Action", "Reward", "Battery_Energy", "System_Loss", "Voltage_Penalty"]]
-    episode_log = [["Date", "Episode", "Total_Reward"]]
+    episode_log = [["Date", "Episode", "Total_Reward", "Total_Loss"]]
 
     for episode in range(episodes):
         state = env.reset()  # Reset the environment at the start of each episode
         episode_reward = 0
+        episode_loss = 0
         current_date = datetime.datetime.now().strftime("%Y-%m-%d")  # Capture today's date
 
         for hour in range(env.max_steps):  # Iterate over the max steps (e.g., 24 for a day)
@@ -533,6 +534,7 @@ def test_agent(agent, env, episodes=5):
             # Update cumulative metrics
             episode_reward += reward
             state = next_state
+            episode_loss += info.get("system_loss", 0)
 
             if done:  # Stop the episode if the environment signals completion
                 break
@@ -542,6 +544,7 @@ def test_agent(agent, env, episodes=5):
             current_date,  # Current date
             episode + 1,  # Episode number
             episode_reward,  # Total reward for the episode
+            episode_loss
         ])
         print(f"Episode {episode + 1}: Total Reward = {episode_reward:.2f}")
 
@@ -571,24 +574,22 @@ def main_with_testing(case_file, testing_data_file, training_data_file, train_ep
     try:
         print(f"Initializing environment with case file: {case_file}")
         
-        # # Training Phase
-        # env_train = PyPowerEnv(case_file, training_data_file, testing_data_file)
-        
-
-        # agent = PPOAgent(state_dim, action_dim)
-        # print("Starting training...")
+        # Training Phase
+        mode = 'train'
+        env_train = PyPowerEnv(case_file, training_data_file, testing_data_file, mode)
+        state_dim = len(env_train.get_initial_state())
+        action_dim = 5
+        agent = PPOAgent(state_dim, action_dim)
+        print("Starting training...")
         # train_agent(agent, env_train, train_episodes)
 
-        # print("Training completed successfully!")
+        print("Training completed successfully!")
 
         # Testing Phase
         print("Starting testing...")
         mode = 'test'
-        env_test = PyPowerEnv(case_file, training_data_file, testing_data_file, mode)
-        state_dim = len(env_test.get_initial_state())
-        action_dim = 5
         agent = PPOAgent(state_dim, action_dim)
-        test_agent(agent, env_test)
+        test_agent(agent, env_train)
 
         print("Testing completed successfully!")
 
