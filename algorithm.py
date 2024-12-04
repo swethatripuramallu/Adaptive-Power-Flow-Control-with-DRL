@@ -348,7 +348,7 @@ class PyPowerEnv:
         
     def update_battery(self, P_b):
         """Update the battery SOC based on the action."""
-        self.battery_energy += self.mu_b * P_b
+        self.battery_energy -= self.mu_b * P_b
         
         # Check for SOC violations and apply penalties
         penalty_soc = 0
@@ -404,7 +404,7 @@ class CriticNetwork(nn.Module):
 # PPO Agent class (same as before)
 class PPOAgent:
     def __init__(self, state_dim, action_dim, lr=0.0003,
-                 gamma=0.99, eps_clip=0.1):
+                 gamma=0.99, eps_clip=0.7):
         self.actor = ActorNetwork(state_dim, action_dim).to(device)
         self.critic = CriticNetwork(state_dim).to(device)
         self.optimizer = optim.Adam(list(self.actor.parameters()) 
@@ -519,11 +519,11 @@ def train_agent(agent, env, episodes=4):
         print(f"Episode {episode + 1}: Total Reward = {episode_reward:.2f}, Total Loss = {episode_loss:.2f}")
 
     # Write logs to CSV files using the csv module
-    with open("step_log_case_training_trial.csv", "w", newline="") as step_file:
+    with open("step_log_case_training_eps_clip_0.7.csv", "w", newline="") as step_file:
         writer = csv.writer(step_file)
         writer.writerows(step_log)
 
-    with open("episode_log_case_training_trial.csv", "w", newline="") as episode_file:
+    with open("episode_log_case_training_eps_clip_0.7.csv", "w", newline="") as episode_file:
         writer = csv.writer(episode_file)
         writer.writerows(episode_log)
 
@@ -606,18 +606,18 @@ def test_agent(agent, env, episodes=5):
         print(f"Episode {episode + 1}: Total Reward = {episode_reward:.2f}")
 
     # Write logs to CSV files using the csv module
-    with open("step_log_case_testing_trial.csv", "w", newline="") as step_file:
+    with open("step_log_case_testing_eps_clip_0.7.csv", "w", newline="") as step_file:
         writer = csv.writer(step_file)
         writer.writerows(step_log)
 
-    with open("episode_log_case_testing_trial.csv", "w", newline="") as episode_file:
+    with open("episode_log_case_testing_eps_clip_0.7.csv", "w", newline="") as episode_file:
         writer = csv.writer(episode_file)
         writer.writerows(episode_log)
 
     print("Testing complete. Logs saved to 'step_log_case_testing.csv' and 'episode_log_case_testing.csv'.")
 
 
-def main_with_testing(case_file, testing_data_file, training_data_file, train_episodes = 1, test_episodes=5):
+def main_with_testing(case_file, testing_data_file, training_data_file, train_episodes = 1090, test_episodes=5):
     """
     Main function to set up and run the PyPowerEnv with PPO training and testing.
 
@@ -637,18 +637,17 @@ def main_with_testing(case_file, testing_data_file, training_data_file, train_ep
         state_dim = len(env_train.get_initial_state())
         action_dim = 5
         agent = PPOAgent(state_dim, action_dim)
-        # print("Starting training...")
-        # train_agent(agent, env_train, train_episodes)
+        print("Starting training...")
+        train_agent(agent, env_train, train_episodes)
 
         # print("Training completed successfully!")
 
         # # Testing Phase
-        # print("Starting testing...")
-        # mode = 'test'
-        # agent = PPOAgent(state_dim, action_dim)
+        print("Starting testing...")
+        mode = 'test'
         test_agent(agent, env_train)
 
-        # print("Testing completed successfully!")
+        print("Testing completed successfully!")
 
     except Exception as e:
         print(f"An error occurred: {e}")
